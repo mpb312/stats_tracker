@@ -1,12 +1,11 @@
 from fastapi import FastAPI, Form
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 import sqlite3
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import os
 from typing import Set
-
 
 DB_PATH = Path(os.environ.get("DB_PATH", "stats.db"))
 
@@ -27,20 +26,31 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
 
 
 def add_column_if_missing(conn: sqlite3.Connection, table: str, col: str, ddl: str) -> None:
-    """
-    ddl example: "value_hits INTEGER"
-    """
     cols = _table_columns(conn, table)
     if col not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
         conn.commit()
 
 
+def _entries_table_has_unique_day(conn: sqlite3.Connection) -> bool:
+    """
+    Detect whether entries table was created with UNIQUE(stat_id, day).
+    We need to remove that to allow multiple entries per day for most stat types.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='entries'"
+    ).fetchone()
+    if not row or not row["sql"]:
+        return False
+    sql = row["sql"].replace("\n", " ").lower()
+    return "unique" in sql and "stat_id" in sql and "day" in sql
+
+
 def init_db():
     conn = db()
     cur = conn.cursor()
 
-    # New-ish schema for stats
+    # Stats table (kinds: numeric, ratio, count_daily)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS stats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,26 +60,26 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+    conn.commit()
 
-    # Entries table supports numeric, boolean_daily, ratio
+    # Create entries table if missing (NOTE: NO UNIQUE(stat_id, day))
     cur.execute("""
         CREATE TABLE IF NOT EXISTS entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             stat_id INTEGER NOT NULL,
             day TEXT NOT NULL,                 -- YYYY-MM-DD (the day the entry is FOR)
-            value_num REAL,                    -- numeric stats
-            value_bool INTEGER,                -- 0/1 for boolean_daily stats
+            value_num REAL,                    -- numeric + count_daily stats
+            value_bool INTEGER,                -- legacy (unused after removing boolean_daily)
             value_hits INTEGER,                -- ratio stats (hits)
             value_total INTEGER,               -- ratio stats (total)
             note TEXT,
             created_at TEXT NOT NULL,
-            FOREIGN KEY(stat_id) REFERENCES stats(id) ON DELETE CASCADE,
-            UNIQUE(stat_id, day)
+            FOREIGN KEY(stat_id) REFERENCES stats(id) ON DELETE CASCADE
         )
     """)
     conn.commit()
 
-    # Ensure columns exist if table pre-existed in a partially migrated state
+    # Ensure columns exist (for older DBs)
     try:
         add_column_if_missing(conn, "stats", "unit", "unit TEXT NOT NULL DEFAULT ''")
         add_column_if_missing(conn, "stats", "kind", "kind TEXT NOT NULL DEFAULT 'numeric'")
@@ -85,11 +95,9 @@ def init_db():
         pass
 
     # Best-effort migration from the very first version (entries had "value" column, no day)
-    # If we detect old entries schema, rebuild and copy.
     try:
         entries_cols = _table_columns(conn, "entries")
         if "value" in entries_cols:
-            # Old schema detected: rename old table, create new, copy value -> value_num
             conn.execute("ALTER TABLE entries RENAME TO entries_old")
 
             conn.execute("""
@@ -103,8 +111,7 @@ def init_db():
                     value_total INTEGER,
                     note TEXT,
                     created_at TEXT NOT NULL,
-                    FOREIGN KEY(stat_id) REFERENCES stats(id) ON DELETE CASCADE,
-                    UNIQUE(stat_id, day)
+                    FOREIGN KEY(stat_id) REFERENCES stats(id) ON DELETE CASCADE
                 )
             """)
 
@@ -113,13 +120,61 @@ def init_db():
                 created = r["created_at"] or datetime.utcnow().isoformat()
                 derived_day = created.split("T")[0] if "T" in created else created[:10]
                 conn.execute(
-                    "INSERT OR REPLACE INTO entries (stat_id, day, value_num, value_bool, value_hits, value_total, note, created_at) "
+                    "INSERT INTO entries (stat_id, day, value_num, value_bool, value_hits, value_total, note, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (r["stat_id"], derived_day, r["value"], None, None, None, r["note"], created),
                 )
 
             conn.execute("DROP TABLE entries_old")
             conn.commit()
+    except Exception:
+        pass
+
+    # Migration: remove UNIQUE(stat_id, day) if it exists in the entries table definition.
+    # SQLite can't drop constraints, so we rebuild the table.
+    try:
+        if _entries_table_has_unique_day(conn):
+            conn.execute("ALTER TABLE entries RENAME TO entries_old2")
+
+            conn.execute("""
+                CREATE TABLE entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stat_id INTEGER NOT NULL,
+                    day TEXT NOT NULL,
+                    value_num REAL,
+                    value_bool INTEGER,
+                    value_hits INTEGER,
+                    value_total INTEGER,
+                    note TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(stat_id) REFERENCES stats(id) ON DELETE CASCADE
+                )
+            """)
+
+            old_rows = conn.execute("SELECT * FROM entries_old2 ORDER BY id ASC").fetchall()
+            for r in old_rows:
+                conn.execute(
+                    "INSERT INTO entries (id, stat_id, day, value_num, value_bool, value_hits, value_total, note, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        r["id"], r["stat_id"], r["day"],
+                        r["value_num"], r["value_bool"], r["value_hits"], r["value_total"],
+                        r["note"], r["created_at"]
+                    ),
+                )
+
+            conn.execute("DROP TABLE entries_old2")
+            conn.commit()
+    except Exception:
+        # If anything goes wrong, the app can still run; worst case you can back up DB and retry.
+        pass
+
+    # Migration: convert any existing boolean_daily stats into count_daily
+    # and convert "true" entries into value_num=1.
+    try:
+        conn.execute("UPDATE stats SET kind = 'count_daily', unit = '' WHERE kind = 'boolean_daily'")
+        conn.execute("UPDATE entries SET value_num = 1 WHERE value_bool = 1 AND value_num IS NULL")
+        conn.commit()
     except Exception:
         pass
 
@@ -241,7 +296,7 @@ def layout(title: str, body: str) -> str:
       font-size: 14px;
     }}
 
-    /* Numeric + ratio entries list */
+    /* Entries list */
     .entry {{
       border-top: 1px solid #eee;
       padding: 10px 0;
@@ -259,43 +314,6 @@ def layout(title: str, body: str) -> str:
       border-radius: 12px;
       font-size: 13px;
     }}
-
-    /* Boolean daily */
-    .day-row {{
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 10px 12px;
-      border-radius: 14px;
-      border: 1px solid #eee;
-      margin-top: 10px;
-      background: #fff;
-    }}
-    .pill {{
-      padding: 6px 10px;
-      border-radius: 999px;
-      font-size: 13px;
-      border: 1px solid #e5e5e5;
-      background: #f4f4f5;
-      display: inline-block;
-      margin-top: 6px;
-    }}
-    .pill-yes {{
-      background: #dcfce7;
-      border-color: #86efac;
-    }}
-    .pill-no {{
-      background: #fee2e2;
-      border-color: #fca5a5;
-    }}
-    .day-actions form {{ margin: 0; }}
-    .day-actions button {{
-      margin-top: 0;
-      width: auto;
-      padding: 8px 12px;
-      border-radius: 12px;
-      font-size: 14px;
-    }}
   </style>
 </head>
 <body>
@@ -310,8 +328,8 @@ def layout(title: str, body: str) -> str:
 def kind_label(stat_kind: str) -> str:
     if stat_kind == "numeric":
         return "Numeric"
-    if stat_kind == "boolean_daily":
-        return "Daily yes/no"
+    if stat_kind == "count_daily":
+        return "Daily count"
     if stat_kind == "ratio":
         return "Hits / Total"
     return "Numeric"
@@ -325,7 +343,7 @@ def home():
 
     stats_html = ""
     if not stats:
-        stats_html = '<div class="muted">No stats yet — add “Weight (kg)”, “Worked out?”, or “Bullseyes”.</div>'
+        stats_html = '<div class="muted">No stats yet — add “Weight (kg)”, “Workouts”, or “Bullseyes”.</div>'
     else:
         for s in stats:
             k = s["kind"]
@@ -350,7 +368,7 @@ def home():
 
     body = f"""
       <h1>Stat Tracker</h1>
-      <p>Create a statistic, then tap it to add entries or toggle days.</p>
+      <p>Create a statistic, then tap it to add entries.</p>
 
       <div class="card">
         <b>Create new statistic</b>
@@ -358,12 +376,12 @@ def home():
           <label class="muted">Type</label>
           <select name="kind">
             <option value="numeric" selected>Numeric (e.g. Weight)</option>
-            <option value="boolean_daily">Daily yes/no (e.g. Worked out?)</option>
+            <option value="count_daily">Daily count (e.g. Workouts per day)</option>
             <option value="ratio">Hits / Total (e.g. Bullseyes)</option>
           </select>
 
           <label class="muted">Name</label>
-          <input name="name" placeholder="Weight / Worked out? / Bullseyes" required />
+          <input name="name" placeholder="Weight / Workouts / Bullseyes" required />
 
           <label class="muted">Unit (numeric only)</label>
           <input name="unit" placeholder="kg" />
@@ -386,10 +404,11 @@ def home():
 @app.post("/stats")
 def create_stat(name: str = Form(...), kind: str = Form("numeric"), unit: str = Form("")):
     kind = (kind or "numeric").strip()
-    if kind not in ("numeric", "boolean_daily", "ratio"):
+    if kind not in ("numeric", "ratio", "count_daily"):
         kind = "numeric"
 
     unit_clean = unit.strip()
+    # unit is only meaningful for numeric
     if kind != "numeric":
         unit_clean = ""
 
@@ -413,71 +432,10 @@ def stat_detail(stat_id: int):
 
     kind = stat["kind"]
 
-    # ---- Boolean daily UI ----
-    if kind == "boolean_daily":
-        today = date.today()
-        days = [(today - timedelta(days=i)) for i in range(14)]
-        day_strs = [d.isoformat() for d in days]
-
-        rows = conn.execute(
-            f"SELECT day, value_bool FROM entries WHERE stat_id = ? AND day IN ({','.join(['?']*len(day_strs))})",
-            (stat_id, *day_strs),
-        ).fetchall()
-        conn.close()
-
-        true_days = {r["day"] for r in rows if r["value_bool"] == 1}
-
-        day_rows_html = ""
-        for d in days:
-            ds = d.isoformat()
-            is_true = ds in true_days
-            label = "Yes ✅" if is_true else "No ⬜"
-            pill_class = "pill pill-yes" if is_true else "pill pill-no"
-            toggle_to = "0" if is_true else "1"
-            btn_text = "Set No" if is_true else "Set Yes"
-
-            if ds == today.isoformat():
-                nice = "Today"
-            elif ds == (today - timedelta(days=1)).isoformat():
-                nice = "Yesterday"
-            else:
-                nice = ds
-
-            day_rows_html += f"""
-              <div class="day-row">
-                <div>
-                  <div><b>{nice}</b></div>
-                  <div class="{pill_class}">{label}</div>
-                </div>
-                <div class="day-actions">
-                  <form method="post" action="/stat/{stat_id}/bool">
-                    <input type="hidden" name="day" value="{ds}" />
-                    <input type="hidden" name="value_bool" value="{toggle_to}" />
-                    <button class="btn-secondary" type="submit">{btn_text}</button>
-                  </form>
-                </div>
-              </div>
-            """
-
-        body = f"""
-          <div style="margin-bottom:10px;">
-            <a class="muted" href="/">← Back</a>
-          </div>
-
-          <h1>{stat['name']}</h1>
-          <p class="muted">Type: Daily yes/no (default is No unless you set Yes). Tap any day to edit.</p>
-
-          <div class="card">
-            <b>Last 14 days</b>
-            {day_rows_html}
-          </div>
-        """
-        return layout(f"{stat['name']} — Stat Tracker", body)
-
     # ---- Ratio UI (hits / total) ----
     if kind == "ratio":
         entries = conn.execute(
-            "SELECT * FROM entries WHERE stat_id = ? ORDER BY day DESC LIMIT 50",
+            "SELECT * FROM entries WHERE stat_id = ? ORDER BY day DESC, id DESC LIMIT 100",
             (stat_id,),
         ).fetchall()
         conn.close()
@@ -512,7 +470,7 @@ def stat_detail(stat_id: int):
           </div>
 
           <h1>{stat['name']}</h1>
-          <p class="muted">Type: Hits / Total • Example: bullseyes hit out of darts thrown</p>
+          <p class="muted">Type: Hits / Total • Multiple entries per day allowed.</p>
 
           <div class="card">
             <b>Add entry</b>
@@ -545,9 +503,84 @@ def stat_detail(stat_id: int):
         """
         return layout(f"{stat['name']} — Stat Tracker", body)
 
+    # ---- Daily count UI (workouts) ----
+    if kind == "count_daily":
+        entries = conn.execute(
+            "SELECT * FROM entries WHERE stat_id = ? ORDER BY day DESC LIMIT 60",
+            (stat_id,),
+        ).fetchall()
+        conn.close()
+
+        entries_html = ""
+        if not entries:
+            entries_html = '<div class="muted">No entries yet.</div>'
+        else:
+            for e in entries:
+                note = f"<div class='muted'>{e['note']}</div>" if e["note"] else ""
+                val = int(e["value_num"]) if e["value_num"] is not None else 0
+                entries_html += f"""
+                  <div class="entry">
+                    <div class="entry-main">
+                      <div><b>{val}</b> <span class="muted">• {e['day']}</span></div>
+                      {note}
+                    </div>
+                    <div class="entry-actions">
+                      <form method="post" action="/entry/{e['id']}/delete">
+                        <input type="hidden" name="stat_id" value="{stat_id}" />
+                        <button class="btn-secondary" type="submit">Remove</button>
+                      </form>
+                    </div>
+                  </div>
+                """
+
+        body = f"""
+          <div style="margin-bottom:10px;">
+            <a class="muted" href="/">← Back</a>
+          </div>
+
+          <h1>{stat['name']}</h1>
+          <p class="muted">Type: Daily count • One entry per day (edits overwrite that day).</p>
+
+          <div class="card">
+            <b>Quick add</b>
+
+            <form method="post" action="/stat/{stat_id}/count/increment">
+              <input type="hidden" name="day" value="{date.today().isoformat()}" />
+              <button type="submit">+1 (Today)</button>
+            </form>
+
+            <div class="muted" style="margin-top:8px;">
+              Tip: use this after each workout session.
+            </div>
+          </div>
+
+          <div class="card">
+            <b>Set workouts for a day</b>
+            <form method="post" action="/stat/{stat_id}/count">
+              <label class="muted">Count</label>
+              <input name="count" inputmode="numeric" placeholder="1" required />
+
+              <label class="muted">Day (YYYY-MM-DD)</label>
+              <input name="day" placeholder="{date.today().isoformat()}" />
+
+              <label class="muted">Note (optional)</label>
+              <textarea name="note" rows="2" placeholder="Optional note..."></textarea>
+
+              <button type="submit">Save</button>
+            </form>
+          </div>
+
+          <div class="card">
+            <b>Recent days</b>
+            {entries_html}
+          </div>
+        """
+
+        return layout(f"{stat['name']} — Stat Tracker", body)
+
     # ---- Numeric UI (default) ----
     entries = conn.execute(
-        "SELECT * FROM entries WHERE stat_id = ? ORDER BY day DESC LIMIT 50",
+        "SELECT * FROM entries WHERE stat_id = ? ORDER BY day DESC, id DESC LIMIT 100",
         (stat_id,),
     ).fetchall()
     conn.close()
@@ -579,7 +612,7 @@ def stat_detail(stat_id: int):
       </div>
 
       <h1>{stat['name']}</h1>
-      <p class="muted">Type: Numeric • Unit: {stat['unit']}</p>
+      <p class="muted">Type: Numeric • Unit: {stat['unit']} • Multiple entries per day allowed.</p>
 
       <div class="card">
         <b>Add entry</b>
@@ -591,7 +624,7 @@ def stat_detail(stat_id: int):
           <input name="day" placeholder="{date.today().isoformat()}" />
 
           <label class="muted">Note (optional)</label>
-          <textarea name="note" rows="2" placeholder="Fasted, morning weigh-in"></textarea>
+          <textarea name="note" rows="2" placeholder="Optional note..."></textarea>
 
           <button type="submit">Save entry</button>
         </form>
@@ -620,8 +653,9 @@ def add_numeric_entry(stat_id: int, value: str = Form(...), day: str = Form(""),
         conn.close()
         return RedirectResponse(f"/stat/{stat_id}", status_code=303)
 
+    # IMPORTANT: allow multiple entries per day => plain INSERT (no REPLACE)
     conn.execute(
-        "INSERT OR REPLACE INTO entries (stat_id, day, value_num, value_bool, value_hits, value_total, note, created_at) "
+        "INSERT INTO entries (stat_id, day, value_num, value_bool, value_hits, value_total, note, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (stat_id, d, v, None, None, None, note.strip() or None, datetime.utcnow().isoformat()),
     )
@@ -639,17 +673,10 @@ def add_ratio_entry(
     note: str = Form(""),
 ):
     d = (day or "").strip() or date.today().isoformat()
-
-    # Parse ints safely
     h = int(hits.strip())
     t = int(total.strip())
 
-    # Basic validation
-    if t <= 0:
-        return RedirectResponse(f"/stat/{stat_id}", status_code=303)
-    if h < 0:
-        return RedirectResponse(f"/stat/{stat_id}", status_code=303)
-    if h > t:
+    if t <= 0 or h < 0 or h > t:
         return RedirectResponse(f"/stat/{stat_id}", status_code=303)
 
     conn = db()
@@ -662,8 +689,9 @@ def add_ratio_entry(
         conn.close()
         return RedirectResponse(f"/stat/{stat_id}", status_code=303)
 
+    # IMPORTANT: allow multiple entries per day => plain INSERT (no REPLACE)
     conn.execute(
-        "INSERT OR REPLACE INTO entries (stat_id, day, value_num, value_bool, value_hits, value_total, note, created_at) "
+        "INSERT INTO entries (stat_id, day, value_num, value_bool, value_hits, value_total, note, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (stat_id, d, None, None, h, t, note.strip() or None, datetime.utcnow().isoformat()),
     )
@@ -672,10 +700,21 @@ def add_ratio_entry(
     return RedirectResponse(f"/stat/{stat_id}", status_code=303)
 
 
-@app.post("/stat/{stat_id}/bool")
-def set_bool_day(stat_id: int, day: str = Form(...), value_bool: str = Form(...)):
-    d = day.strip()
-    vb = 1 if value_bool.strip() == "1" else 0
+@app.post("/stat/{stat_id}/count")
+def set_daily_count(
+    stat_id: int,
+    count: str = Form(...),
+    day: str = Form(""),
+    note: str = Form(""),
+):
+    """
+    Enforce "one entry per day" *only* for count_daily stats (e.g. workouts).
+    We do that in application logic (not DB constraint).
+    """
+    d = (day or "").strip() or date.today().isoformat()
+    c = int(count.strip())
+    if c < 0:
+        c = 0
 
     conn = db()
     stat = conn.execute("SELECT kind FROM stats WHERE id = ?", (stat_id,)).fetchone()
@@ -683,21 +722,57 @@ def set_bool_day(stat_id: int, day: str = Form(...), value_bool: str = Form(...)
         conn.close()
         return RedirectResponse("/", status_code=303)
 
-    if stat["kind"] != "boolean_daily":
+    if stat["kind"] != "count_daily":
         conn.close()
         return RedirectResponse(f"/stat/{stat_id}", status_code=303)
 
-    if vb == 1:
-        # Store explicit "true"
-        conn.execute(
-            "INSERT OR REPLACE INTO entries (stat_id, day, value_num, value_bool, value_hits, value_total, note, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (stat_id, d, None, 1, None, None, None, datetime.utcnow().isoformat()),
-        )
-    else:
-        # Default false => delete row if it exists
-        conn.execute("DELETE FROM entries WHERE stat_id = ? AND day = ?", (stat_id, d))
+    # Delete any existing rows for that day for this stat, then insert a single canonical row.
+    conn.execute("DELETE FROM entries WHERE stat_id = ? AND day = ?", (stat_id, d))
+    conn.execute(
+        "INSERT INTO entries (stat_id, day, value_num, value_bool, value_hits, value_total, note, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (stat_id, d, float(c), None, None, None, note.strip() or None, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/stat/{stat_id}", status_code=303)
 
+@app.post("/stat/{stat_id}/count/increment")
+def increment_daily_count(
+    stat_id: int,
+    day: str = Form(""),
+):
+    """
+    +1 for a count_daily stat on a given day (defaults to today).
+    Keeps the "one entry per day" rule by updating the canonical row.
+    """
+    d = (day or "").strip() or date.today().isoformat()
+
+    conn = db()
+    stat = conn.execute("SELECT kind FROM stats WHERE id = ?", (stat_id,)).fetchone()
+    if not stat:
+        conn.close()
+        return RedirectResponse("/", status_code=303)
+
+    if stat["kind"] != "count_daily":
+        conn.close()
+        return RedirectResponse(f"/stat/{stat_id}", status_code=303)
+
+    row = conn.execute(
+        "SELECT id, value_num FROM entries WHERE stat_id = ? AND day = ? ORDER BY id DESC LIMIT 1",
+        (stat_id, d),
+    ).fetchone()
+
+    current = int(row["value_num"]) if row and row["value_num"] is not None else 0
+    new_val = current + 1
+
+    # Enforce one entry per day: replace existing row for that day
+    conn.execute("DELETE FROM entries WHERE stat_id = ? AND day = ?", (stat_id, d))
+    conn.execute(
+        "INSERT INTO entries (stat_id, day, value_num, value_bool, value_hits, value_total, note, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (stat_id, d, float(new_val), None, None, None, None, datetime.utcnow().isoformat()),
+    )
     conn.commit()
     conn.close()
     return RedirectResponse(f"/stat/{stat_id}", status_code=303)
@@ -723,18 +798,17 @@ def delete_entry(entry_id: int, stat_id: int = Form(...)):
 
 @app.get("/manifest.webmanifest")
 def manifest():
-    return {
-        "name": "Stat Tracker",
-        "short_name": "Stats",
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#fafafa",
-        "theme_color": "#111111",
-        "icons": [
-            {
-                "src": "/assets/apple-touch-icon.png",
-                "sizes": "180x180",
-                "type": "image/png"
-            }
-        ]
-    }
+    return JSONResponse(
+        {
+            "name": "Stat Tracker",
+            "short_name": "Stats",
+            "start_url": "/",
+            "display": "standalone",
+            "background_color": "#fafafa",
+            "theme_color": "#111111",
+            "icons": [
+                {"src": "/assets/apple-touch-icon.png", "sizes": "180x180", "type": "image/png"}
+            ],
+        },
+        media_type="application/manifest+json",
+    )
