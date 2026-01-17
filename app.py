@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Form
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse
 import sqlite3
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Set
 DB_PATH = Path(os.environ.get("DB_PATH", "stats.db"))
 
 app = FastAPI()
+app.mount("/assets", StaticFiles(directory="assets"), name="assets")
 
 
 def db():
@@ -131,6 +133,13 @@ def layout(title: str, body: str) -> str:
     return f"""<!doctype html>
 <html>
 <head>
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#111111">
+
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Stat Tracker">
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{title}</title>
@@ -710,3 +719,22 @@ def delete_entry(entry_id: int, stat_id: int = Form(...)):
     conn.commit()
     conn.close()
     return RedirectResponse(f"/stat/{stat_id}", status_code=303)
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    return {
+        "name": "Stat Tracker",
+        "short_name": "Stats",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#fafafa",
+        "theme_color": "#111111",
+        "icons": [
+            {
+                "src": "/assets/apple-touch-icon.png",
+                "sizes": "180x180",
+                "type": "image/png"
+            }
+        ]
+    }
