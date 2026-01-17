@@ -4,6 +4,8 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, date, timedelta
 import os
+from typing import Set
+
 
 DB_PATH = Path(os.environ.get("DB_PATH", "stats.db"))
 
@@ -17,7 +19,7 @@ def db():
     return conn
 
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+def _table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return {r["name"] for r in rows}
 
